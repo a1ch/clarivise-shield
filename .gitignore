@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Supabase
+supabase/.env
+supabase/functions/.env
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbbs.db
+
+# Editor
+.vscode/
+.idea/
+.cursor/
+
+# Build
+dist/
+build/
+.next/
+
+# Logs
+*.log
+logs/
