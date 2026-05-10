@@ -1,16 +1,27 @@
 """
 Clarivise Shield Connector
 Azure Container App — FastAPI service that:
-  1. Receives Graph API change notifications for the shield-scan mailbox
-  2. Fetches each new email via Graph API
-  3. POSTs parsed content to the Shield inbound edge function
-  4. Tags the email subject based on verdict (marking mode — no blocking)
+  1. [Active] Polls the shield-scan mailbox every 60s for unread messages (Option B)
+  2. [Ready]  Receives Graph API change notifications via webhook (Option A — future)
+  3. Fetches each new email via Graph API
+  4. POSTs parsed content to the Shield inbound edge function
+  5. Tags the email subject based on verdict (marking mode — no blocking)
 
 Verdict actions (marking only):
   SAFE       → do nothing
   SPAM       → prepend [SPAM] to subject
   SUSPICIOUS → prepend [SUSPICIOUS] to subject
   PHISHING   → prepend [PHISHING] to subject + insert warning banner in body
+
+Polling vs Webhooks:
+  Option B (current): On startup, a background task polls MAILBOX for unread
+  mail on POLL_INTERVAL_SECONDS cadence. Messages are marked as read after
+  processing so they are not re-scanned.
+
+  Option A (future): Graph API push notifications via /webhook/graph. Requires
+  a public HTTPS URL and an active subscription. All webhook code below is
+  preserved and ready — just register a subscription via /webhook/subscription/create
+  and set POLL_INTERVAL_SECONDS=0 to disable polling once webhooks are live.
 """
 
 import asyncio
@@ -19,6 +30,7 @@ import hmac
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -34,21 +46,41 @@ logging.basicConfig(
 log = logging.getLogger("shield-connector")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TENANT_ID         = os.environ["AZURE_TENANT_ID"]
-CLIENT_ID         = os.environ["AZURE_CLIENT_ID"]
-CLIENT_SECRET     = os.environ["AZURE_CLIENT_SECRET"]
-MAILBOX           = os.environ["SHIELD_MAILBOX"]          # shield-scan@ingotsolutions.com
-SHIELD_WEBHOOK    = os.environ["SHIELD_INBOUND_URL"]      # https://eysvvjrsjbfyeuggyhey.supabase.co/functions/v1/shield-inbound
-SHIELD_SECRET     = os.environ["SHIELD_INBOUND_SECRET"]   # clarivise-shield-ee47a2b9-...
+TENANT_ID           = os.environ["AZURE_TENANT_ID"]
+CLIENT_ID           = os.environ["AZURE_CLIENT_ID"]
+CLIENT_SECRET       = os.environ["AZURE_CLIENT_SECRET"]
+MAILBOX             = os.environ["SHIELD_MAILBOX"]          # shield-scan@ingotsolutions.com
+SHIELD_WEBHOOK      = os.environ["SHIELD_INBOUND_URL"]      # https://...supabase.co/functions/v1/shield-inbound
+SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]   # clarivise-shield-ee47a2b9-...
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
-ORG_ID            = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
+ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
+POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))  # set to 0 to disable polling
 
-GRAPH_BASE        = "https://graph.microsoft.com/v1.0"
-TOKEN_URL         = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-MAX_BODY_CHARS    = 3000
+GRAPH_BASE     = "https://graph.microsoft.com/v1.0"
+TOKEN_URL      = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+MAX_BODY_CHARS = 3000
+
+# ── Lifespan (startup/shutdown) ────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start background polling loop on startup; cancel on shutdown."""
+    poll_task = None
+    if POLL_INTERVAL_SECS > 0:
+        log.info("Starting mailbox polling loop (interval: %ds)", POLL_INTERVAL_SECS)
+        poll_task = asyncio.create_task(mailbox_poll_loop())
+    else:
+        log.info("Polling disabled (POLL_INTERVAL_SECONDS=0) — webhook-only mode")
+    yield
+    if poll_task:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+        log.info("Polling loop stopped")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Clarivise Shield Connector", version="1.0.0")
+app = FastAPI(title="Clarivise Shield Connector", version="1.0.0", lifespan=lifespan)
 
 # In-memory token cache
 _token_cache: dict = {"token": None, "expires_at": 0.0}
@@ -103,7 +135,7 @@ def extract_links(body_html: str, body_text: str) -> list[dict]:
     """Extract links from email body HTML."""
     links = []
     seen  = set()
-    for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', body_html or "", re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(r'<a[^>]+href=["\'"]([^"\'"]+)["\'"][^>]*>(.*?)</a>', body_html or "", re.IGNORECASE | re.DOTALL):
         href    = match.group(1).strip()
         display = re.sub(r"<[^>]+>", "", match.group(2)).strip()[:200]
         if href and href not in seen and not href.startswith("mailto:"):
@@ -144,9 +176,6 @@ def parse_message(msg: dict) -> dict:
     reply_to      = reply_to_list[0]["emailAddress"]["address"] if reply_to_list else None
 
     links = extract_links(body_html, body_clean)
-
-    # Check if sender is external (not in our org)
-    is_external = sender_addr.lower().split("@")[-1] if "@" in sender_addr else ""
 
     return {
         "subject":        subject,
@@ -217,7 +246,6 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
     prefix  = SUBJECT_PREFIXES.get(verdict, "")
     updates = {}
 
-    # Fetch current subject to avoid double-tagging
     try:
         msg = await graph_get(client, f"/users/{MAILBOX}/messages/{message_id}?$select=subject,body")
         current_subject = msg.get("subject", "")
@@ -225,7 +253,6 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
         if not current_subject.startswith(prefix):
             updates["subject"] = prefix + current_subject
 
-        # For phishing, insert a warning banner at the top of the body
         if verdict == "PHISHING":
             body_obj     = msg.get("body", {})
             body_content = body_obj.get("content", "")
@@ -272,7 +299,6 @@ async def process_message(message_id: str):
 
     async with httpx.AsyncClient() as client:
         try:
-            # Fetch full message
             msg = await graph_get(
                 client,
                 f"/users/{MAILBOX}/messages/{message_id}"
@@ -292,7 +318,6 @@ async def process_message(message_id: str):
             log.warning("No Shield result for %s — skipping tag", message_id)
             return
 
-        # Shield wraps result in a "result" key
         analysis = result.get("result", result)
         verdict  = analysis.get("verdict", "SAFE")
         score    = analysis.get("phishing_score", 0)
@@ -301,27 +326,113 @@ async def process_message(message_id: str):
 
         await tag_email(client, message_id, verdict, analysis)
 
+        # Mark as read so the polling loop doesn't pick it up again
+        try:
+            await graph_patch(client, f"/users/{MAILBOX}/messages/{message_id}", {"isRead": True})
+        except Exception as ex:
+            log.warning("Could not mark message %s as read: %s", message_id, ex)
 
-# ── Graph API webhook endpoints ────────────────────────────────────────────────
+
+# ── Option B: Mailbox polling loop ─────────────────────────────────────────────
+async def poll_mailbox_once():
+    """
+    Fetch all unread messages from the shared mailbox and enqueue them for processing.
+    Messages are marked as read inside process_message() after a successful scan,
+    so they won't be picked up on the next poll.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            data = await graph_get(
+                client,
+                f"/users/{MAILBOX}/messages"
+                "?$filter=isRead eq false"
+                "&$select=id,subject,from,receivedDateTime"
+                "&$orderby=receivedDateTime asc"
+                "&$top=50",
+            )
+        except Exception as ex:
+            log.error("Poll: failed to list mailbox messages: %s", ex)
+            return
+
+        messages = data.get("value", [])
+        if not messages:
+            log.debug("Poll: no unread messages")
+            return
+
+        log.info("Poll: found %d unread message(s)", len(messages))
+        for msg in messages:
+            message_id = msg.get("id")
+            subject    = msg.get("subject", "")[:60]
+            if message_id and message_id not in _processed:
+                log.info("Poll: queuing message [%s]", subject)
+                asyncio.create_task(process_message(message_id))
+
+
+async def mailbox_poll_loop():
+    """
+    Background loop: poll the shared mailbox on a fixed interval.
+    Runs until cancelled (on app shutdown).
+
+    To migrate to Option A (Graph API webhooks):
+      1. Register a subscription via POST /webhook/subscription/create
+      2. Set POLL_INTERVAL_SECONDS=0 in your container env vars
+      3. The webhook endpoint at /webhook/graph takes over
+    """
+    # Brief startup delay to let the app finish initialising
+    await asyncio.sleep(5)
+    log.info("Poll loop started — interval %ds, mailbox: %s", POLL_INTERVAL_SECS, MAILBOX)
+    while True:
+        try:
+            await poll_mailbox_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            log.error("Poll loop unexpected error: %s", ex)
+        await asyncio.sleep(POLL_INTERVAL_SECS)
+
+
+# ── Health & admin endpoints ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "clarivise-shield-connector"}
+    return {
+        "status":       "ok",
+        "service":      "clarivise-shield-connector",
+        "polling":      POLL_INTERVAL_SECS > 0,
+        "poll_interval": POLL_INTERVAL_SECS,
+        "processed":    len(_processed),
+    }
 
 
+@app.post("/webhook/reprocess/{message_id}")
+async def reprocess(message_id: str, background_tasks: BackgroundTasks):
+    """Manually reprocess a specific message — useful for testing."""
+    _processed.discard(message_id)
+    background_tasks.add_task(process_message, message_id)
+    return {"queued": message_id}
+
+
+@app.post("/poll/now")
+async def poll_now():
+    """Trigger an immediate poll of the mailbox — useful for testing without waiting."""
+    asyncio.create_task(poll_mailbox_once())
+    return {"status": "poll triggered"}
+
+
+# ── Option A: Graph API webhook endpoints (ready for future use) ───────────────
 @app.post("/webhook/graph")
 async def graph_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Receives Graph API change notifications.
+    Receives Graph API change notifications (Option A — future).
     Graph sends a validationToken on first subscription — must echo it back.
     Subsequent POSTs are actual notifications.
+    Enable by registering a subscription via /webhook/subscription/create
+    and setting POLL_INTERVAL_SECONDS=0 to disable polling.
     """
-    # Subscription validation handshake
     validation_token = request.query_params.get("validationToken")
     if validation_token:
         log.info("Graph subscription validation handshake")
         return PlainTextResponse(validation_token, status_code=200)
 
-    # Validate notification secret if configured
     if NOTIFICATION_SECRET:
         client_state = ""
         try:
@@ -352,16 +463,7 @@ async def graph_webhook(request: Request, background_tasks: BackgroundTasks):
             log.info("New message notification: %s", message_id)
             background_tasks.add_task(process_message, message_id)
 
-    # Must return 202 quickly — processing happens in background
     return Response(status_code=202)
-
-
-@app.post("/webhook/reprocess/{message_id}")
-async def reprocess(message_id: str, background_tasks: BackgroundTasks):
-    """Manually reprocess a specific message — useful for testing."""
-    _processed.discard(message_id)
-    background_tasks.add_task(process_message, message_id)
-    return {"queued": message_id}
 
 
 @app.get("/webhook/subscription")
@@ -377,15 +479,18 @@ async def get_subscription_status():
 
 @app.post("/webhook/subscription/create")
 async def create_subscription(request: Request):
-    """Create or renew the Graph API webhook subscription."""
+    """
+    Create or renew the Graph API webhook subscription (Option A — future).
+    Once created, set POLL_INTERVAL_SECONDS=0 to switch from polling to push.
+    """
     body = await request.json()
-    notification_url = body.get("notification_url")  # public HTTPS URL of this container
+    notification_url = body.get("notification_url")
 
     if not notification_url:
         raise HTTPException(status_code=400, detail="notification_url required")
 
     from datetime import timedelta
-    expiry = (datetime.now(timezone.utc) + timedelta(hours=4230)).strftime("%Y-%m-%dT%H:%M:%SZ")  # max ~179 days
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=4230)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     subscription_body = {
         "changeType":         "created",
