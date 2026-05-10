@@ -5,11 +5,12 @@ on:
     branches: [main]
     paths:
       - 'connector/**'
+  workflow_dispatch:
 
 env:
-  REGISTRY:      ${{ secrets.ACR_LOGIN_SERVER }}
-  IMAGE_NAME:    clarivise-shield-connector
-  RESOURCE_GROUP: rg-clarivise-shield
+  REGISTRY:       ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME:     clarivise-shield-connector
+  RESOURCE_GROUP: Clarivise2
   CONTAINER_APP:  clarivise-shield-connector
   CONTAINER_ENV:  clarivise-shield-env
 
