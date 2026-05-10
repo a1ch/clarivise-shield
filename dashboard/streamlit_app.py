@@ -70,7 +70,7 @@ def inject_theme():
     st.markdown("""
 <style>
     :root { --ink:#0f172a; --muted:#64748b; --accent:#2E75B6; }
-    .block-container { padding-top:0.5rem !important; max-width:1200px; }
+    .block-container { padding-top:3.5rem !important; max-width:1200px; }
     [data-testid="stAppViewContainer"] { background:#0b1929; }
     [data-testid="stMainBlockContainer"] { color:#e2e8f0; }
     [data-testid="stSidebar"] { background:#0f2035 !important; }
@@ -121,7 +121,6 @@ def auth_header():
 
 # ── Invite / Set Password flow ─────────────────────────────────────────────────
 def render_set_password(access_token: str, refresh_token: str):
-    """Shown when a user clicks their invite link — lets them set a password."""
     auth_header()
     st.markdown("### Set your password")
     st.caption("You've been invited to Clarivise Shield. Set a password to activate your account.")
@@ -143,13 +142,10 @@ def render_set_password(access_token: str, refresh_token: str):
             st.error("Configuration error — contact support.")
             return
         try:
-            # Use the invite tokens to set the session then update password
             anon.auth.set_session(access_token, refresh_token)
             anon.auth.update_user({"password": pw})
-            # Store session so they land on the dashboard immediately
             st.session_state[SB_ACCESS]  = access_token
             st.session_state[SB_REFRESH] = refresh_token
-            # Clear the invite params from URL
             st.query_params.clear()
             st.success("Password set! Taking you to your dashboard...")
             st.rerun()
@@ -186,8 +182,6 @@ def render_login():
                     return
                 st.session_state[SB_ACCESS]  = sess.access_token
                 st.session_state[SB_REFRESH] = sess.refresh_token
-
-                # Verify shield_admins record exists
                 svc  = get_svc_client()
                 user = getattr(res, "user", None)
                 if svc and user:
@@ -296,7 +290,6 @@ def render_super_admin(svc: Client):
                     if existing.data:
                         st.warning(f"{invite_email} already has an admin record.")
                     else:
-                        # Insert admin record first — trigger will link auth_user_id on signup
                         svc.table("shield_admins").insert({
                             "org_id": org_id, "email": invite_email,
                             "role": invite_role,
@@ -568,8 +561,8 @@ def render_settings(svc: Client, org_id: str):
     org = org_data[0]
 
     with st.form("settings"):
-        st.text_input("Organization name",     value=org.get("name", ""),             disabled=True)
-        st.text_input("Tenant domain",         value=org.get("tenant_domain", ""),    disabled=True)
+        st.text_input("Organization name",      value=org.get("name", ""),                  disabled=True)
+        st.text_input("Tenant domain",          value=org.get("tenant_domain", ""),         disabled=True)
         st.text_input("Inbound webhook secret", value=org.get("inbound_webhook_secret", ""), disabled=True,
                       help="Use this as the secret in your M365 mail flow rule.")
         it_email      = st.text_input("IT security email", value=org.get("it_security_email", "") or "")
@@ -598,12 +591,9 @@ def main():
     )
     inject_theme()
 
-    # ── Handle invite / password-reset link ───────────────────────────────────
-    # Supabase appends #access_token=...&type=invite to the URL.
-    # Streamlit exposes these as query params after the fragment is parsed.
-    params = st.query_params
-    token_type   = params.get("type", "")
-    access_token = params.get("access_token", "")
+    params        = st.query_params
+    token_type    = params.get("type", "")
+    access_token  = params.get("access_token", "")
     refresh_token = params.get("refresh_token", "")
 
     if token_type in ("invite", "recovery") and access_token:
