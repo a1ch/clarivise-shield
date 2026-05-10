@@ -11,7 +11,7 @@ env:
   REGISTRY:       ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_NAME:     clarivise-shield-connector
   RESOURCE_GROUP: Clarivise2
-  CONTAINER_APP:  clarivise3
+  CONTAINER_APP:  clarivise4
 
 jobs:
   build-and-deploy:
