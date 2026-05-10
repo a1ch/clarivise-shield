@@ -10,8 +10,8 @@ on:
 env:
   REGISTRY:       ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_NAME:     clarivise-shield-connector
-  RESOURCE_GROUP: Clarivise2
-  CONTAINER_APP:  clarivise4
+  RESOURCE_GROUP: Clarivise5
+  CONTAINER_APP:  clarivise5
 
 jobs:
   build-and-deploy:
