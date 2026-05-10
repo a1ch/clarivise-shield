@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  connector:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      - SHIELD_MAILBOX=${SHIELD_MAILBOX}
+      - SHIELD_INBOUND_URL=${SHIELD_INBOUND_URL}
+      - SHIELD_INBOUND_SECRET=${SHIELD_INBOUND_SECRET}
+      - SHIELD_ORG_ID=${SHIELD_ORG_ID}
+      - GRAPH_NOTIFICATION_SECRET=${GRAPH_NOTIFICATION_SECRET}
+    restart: unless-stopped
