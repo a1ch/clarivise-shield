@@ -47,14 +47,14 @@ log = logging.getLogger("shield-connector")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 TENANT_ID           = os.environ["AZURE_TENANT_ID"]
-CLIENT_ID           = os.environ["AZURE_CLIENT_ID"]
-CLIENT_SECRET       = os.environ["AZURE_CLIENT_SECRET"]
-MAILBOX             = os.environ["SHIELD_MAILBOX"]          # shield-scan@ingotsolutions.com
-SHIELD_WEBHOOK      = os.environ["SHIELD_INBOUND_URL"]      # https://...supabase.co/functions/v1/shield-inbound
-SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]   # clarivise-shield-ee47a2b9-...
+CLIENT_ID          = os.environ["AZURE_CLIENT_ID"]
+CLIENT_SECRET      = os.environ["AZURE_CLIENT_SECRET"]
+MAILBOX            = os.environ["SHIELD_MAILBOX"]          # shield-scan@ingotsolutions.com
+SHIELD_WEBHOOK     = os.environ["SHIELD_INBOUND_URL"]      # https://...supabase.co/functions/v1/shield-inbound
+SHIELD_SECRET      = os.environ["SHIELD_INBOUND_SECRET"]   # clarivise-shield-ee47a2b9-...
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
-ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
-POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))  # set to 0 to disable polling
+ORG_ID             = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
+POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))  # set to 0 to disable polling
 
 GRAPH_BASE     = "https://graph.microsoft.com/v1.0"
 TOKEN_URL      = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
@@ -135,7 +135,7 @@ def extract_links(body_html: str, body_text: str) -> list[dict]:
     """Extract links from email body HTML."""
     links = []
     seen  = set()
-    for match in re.finditer(r'<a[^>]+href=["\'"]([^"\'"]+)["\'"][^>]*>(.*?)</a>', body_html or "", re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', body_html or "", re.IGNORECASE | re.DOTALL):
         href    = match.group(1).strip()
         display = re.sub(r"<[^>]+>", "", match.group(2)).strip()[:200]
         if href and href not in seen and not href.startswith("mailto:"):
@@ -200,16 +200,20 @@ def parse_message(msg: dict) -> dict:
 
 # ── Shield analysis ────────────────────────────────────────────────────────────
 async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Optional[dict]:
-    """POST email data to the Shield inbound edge function."""
+    """
+    POST email data to the Shield inbound edge function.
+    The edge function reads fields directly from the payload (not nested under emailData).
+    It returns: { verdict, action, summary } — the full AI result is stored in Supabase.
+    """
     try:
         res = await client.post(
             SHIELD_WEBHOOK,
             headers={
-                "Content-Type":      "application/json",
-                "x-shield-secret":   SHIELD_SECRET,
-                "x-org-id":          ORG_ID,
+                "Content-Type":    "application/json",
+                "x-shield-secret": SHIELD_SECRET,
+                "x-org-id":        ORG_ID,
             },
-            json={"emailData": email_data, "tenantDomain": "ingotsolutions.com"},
+            json=email_data,  # send fields directly, not wrapped in emailData
             timeout=30,
         )
         if res.status_code == 200:
@@ -225,7 +229,7 @@ WARNING_BANNER = """
 <div style="background:#fff3cd;border:2px solid #ffc107;border-radius:6px;padding:12px 16px;margin:0 0 16px;font-family:Arial,sans-serif;font-size:13px;color:#856404;">
   <strong>⚠️ Clarivise Shield Warning</strong><br>
   This email has been flagged as <strong>{verdict}</strong> by Clarivise Shield AI.
-  Phishing score: {score}/100. {summary}
+  {summary}
   <br><em>Do not click links or open attachments unless you are certain of the sender's identity.</em>
 </div>
 """
@@ -259,9 +263,8 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
             body_type    = body_obj.get("contentType", "text")
 
             if body_type == "html":
-                banner  = WARNING_BANNER.format(
+                banner = WARNING_BANNER.format(
                     verdict=verdict,
-                    score=result.get("phishing_score", "?"),
                     summary=result.get("summary", "")[:200],
                 )
                 updates["body"] = {
@@ -269,7 +272,7 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
                     "content":     banner + body_content,
                 }
             else:
-                warning = f"\n\n⚠️ CLARIVISE SHIELD WARNING: This email was flagged as PHISHING (score: {result.get('phishing_score','?')}/100). {result.get('summary','')}\n\n"
+                warning = f"\n\n⚠️ CLARIVISE SHIELD WARNING: This email was flagged as PHISHING. {result.get('summary', '')}\n\n"
                 updates["body"] = {
                     "contentType": "text",
                     "content":     warning + body_content,
@@ -318,13 +321,14 @@ async def process_message(message_id: str):
             log.warning("No Shield result for %s — skipping tag", message_id)
             return
 
-        analysis = result.get("result", result)
-        verdict  = analysis.get("verdict", "SAFE")
-        score    = analysis.get("phishing_score", 0)
+        # Edge function returns { verdict, action, summary } directly
+        verdict = result.get("verdict", "SAFE")
+        action  = result.get("action", "delivered")
+        summary = result.get("summary", "")
 
-        log.info("Verdict: %s (phishing=%s) for message %s", verdict, score, message_id)
+        log.info("Verdict: %s | Action: %s | %s", verdict, action, summary[:80])
 
-        await tag_email(client, message_id, verdict, analysis)
+        await tag_email(client, message_id, verdict, result)
 
         # Mark as read so the polling loop doesn't pick it up again
         try:
@@ -395,11 +399,11 @@ async def mailbox_poll_loop():
 @app.get("/health")
 async def health():
     return {
-        "status":       "ok",
-        "service":      "clarivise-shield-connector",
-        "polling":      POLL_INTERVAL_SECS > 0,
+        "status":        "ok",
+        "service":       "clarivise-shield-connector",
+        "polling":       POLL_INTERVAL_SECS > 0,
         "poll_interval": POLL_INTERVAL_SECS,
-        "processed":    len(_processed),
+        "processed":     len(_processed),
     }
 
 
