@@ -4,8 +4,9 @@ Azure Container App — FastAPI service that:
   1. [Active] Polls the shield-scan mailbox every 60s for unread messages (Option B)
   2. [Ready]  Receives Graph API change notifications via webhook (Option A — future)
   3. Fetches each new email via Graph API
-  4. POSTs parsed content to the Shield inbound edge function
-  5. Tags the email subject based on verdict (marking mode — no blocking)
+  4. Resolves short URLs to their final destination (zero token cost)
+  5. POSTs parsed content to the Shield inbound edge function
+  6. Tags the email subject based on verdict (marking mode — no blocking)
 
 Verdict actions (marking only):
   SAFE       → do nothing
@@ -33,6 +34,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
@@ -47,18 +49,35 @@ log = logging.getLogger("shield-connector")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 TENANT_ID           = os.environ["AZURE_TENANT_ID"]
-CLIENT_ID          = os.environ["AZURE_CLIENT_ID"]
-CLIENT_SECRET      = os.environ["AZURE_CLIENT_SECRET"]
-MAILBOX            = os.environ["SHIELD_MAILBOX"]          # shield-scan@ingotsolutions.com
-SHIELD_WEBHOOK     = os.environ["SHIELD_INBOUND_URL"]      # https://...supabase.co/functions/v1/shield-inbound
-SHIELD_SECRET      = os.environ["SHIELD_INBOUND_SECRET"]   # clarivise-shield-ee47a2b9-...
+CLIENT_ID           = os.environ["AZURE_CLIENT_ID"]
+CLIENT_SECRET       = os.environ["AZURE_CLIENT_SECRET"]
+MAILBOX             = os.environ["SHIELD_MAILBOX"]
+SHIELD_WEBHOOK      = os.environ["SHIELD_INBOUND_URL"]
+SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
-ORG_ID             = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
-POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))  # set to 0 to disable polling
+ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
+POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
 GRAPH_BASE     = "https://graph.microsoft.com/v1.0"
 TOKEN_URL      = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 MAX_BODY_CHARS = 3000
+
+# ── Known URL shortener domains ────────────────────────────────────────────────
+# These are resolved to their final destination before AI analysis.
+# Zero token cost — just HTTP HEAD requests to follow redirects.
+SHORT_LINK_DOMAINS = {
+    # Google
+    "c.gle", "goo.gl", "g.co",
+    # Generic
+    "bit.ly", "bitly.com", "tinyurl.com", "t.co", "ow.ly",
+    "buff.ly", "dlvr.it", "ift.tt", "tiny.cc", "short.link",
+    "rb.gy", "cutt.ly", "bl.ink", "shorte.st", "clck.ru",
+    # Microsoft
+    "aka.ms", "go.microsoft.com",
+    # Email marketing (resolve so AI sees landing page domain)
+    "click.em.yourdomain.com", "mailchi.mp", "list-manage.com",
+}
+
 
 # ── Lifespan (startup/shutdown) ────────────────────────────────────────────────
 @asynccontextmanager
@@ -82,9 +101,7 @@ async def lifespan(app: FastAPI):
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Clarivise Shield Connector", version="1.0.0", lifespan=lifespan)
 
-# In-memory token cache
 _token_cache: dict = {"token": None, "expires_at": 0.0}
-# Track processed message IDs to avoid double-processing
 _processed: set = set()
 
 
@@ -130,6 +147,60 @@ async def graph_patch(client: httpx.AsyncClient, path: str, body: dict) -> dict:
     return res.json()
 
 
+# ── URL short-link resolver ────────────────────────────────────────────────────
+def is_short_link(url: str) -> bool:
+    """Return True if the URL's domain is a known shortener."""
+    try:
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        return domain in SHORT_LINK_DOMAINS
+    except Exception:
+        return False
+
+
+async def resolve_url(url: str, timeout: float = 5.0) -> str:
+    """
+    Follow redirects on a URL and return the final destination.
+    Uses HEAD to avoid downloading response bodies.
+    Falls back to the original URL on any error.
+    """
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            headers={"User-Agent": "Clarivise-Shield/1.0 (link-resolver)"},
+        ) as client:
+            res = await client.head(url)
+            final = str(res.url)
+            if final != url:
+                log.info("Resolved short link: %s → %s", url, final)
+            return final
+    except Exception as ex:
+        log.debug("Could not resolve %s: %s", url, ex)
+        return url
+
+
+async def resolve_short_links(links: list[dict]) -> list[dict]:
+    """
+    For any link whose domain is a known shortener, resolve it to its
+    final destination and update both fullUrl and href (domain).
+    Runs all resolutions concurrently — typically adds <200ms total.
+    """
+    async def resolve_one(link: dict) -> dict:
+        url = link.get("fullUrl", "")
+        if not url or not is_short_link(url):
+            return link
+        resolved = await resolve_url(url)
+        if resolved != url:
+            try:
+                resolved_domain = urlparse(resolved).netloc.lower().replace("www.", "")
+                return {**link, "fullUrl": resolved, "href": resolved_domain, "shortLinkResolved": True, "originalUrl": url}
+            except Exception:
+                pass
+        return link
+
+    return list(await asyncio.gather(*[resolve_one(l) for l in links]))
+
+
 # ── Email parsing ──────────────────────────────────────────────────────────────
 def extract_links(body_html: str, body_text: str) -> list[dict]:
     """Extract links from email body HTML."""
@@ -141,7 +212,6 @@ def extract_links(body_html: str, body_text: str) -> list[dict]:
         if href and href not in seen and not href.startswith("mailto:"):
             seen.add(href)
             try:
-                from urllib.parse import urlparse
                 parsed = urlparse(href)
                 domain = parsed.netloc.lower().replace("www.", "")
                 links.append({"display": display or domain, "href": domain, "fullUrl": href})
@@ -200,11 +270,7 @@ def parse_message(msg: dict) -> dict:
 
 # ── Shield analysis ────────────────────────────────────────────────────────────
 async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Optional[dict]:
-    """
-    POST email data to the Shield inbound edge function.
-    The edge function reads fields directly from the payload (not nested under emailData).
-    It returns: { verdict, action, summary } — the full AI result is stored in Supabase.
-    """
+    """POST email data to the Shield inbound edge function."""
     try:
         res = await client.post(
             SHIELD_WEBHOOK,
@@ -213,7 +279,7 @@ async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Op
                 "x-shield-secret": SHIELD_SECRET,
                 "x-org-id":        ORG_ID,
             },
-            json=email_data,  # send fields directly, not wrapped in emailData
+            json=email_data,
             timeout=30,
         )
         if res.status_code == 200:
@@ -294,7 +360,6 @@ async def process_message(message_id: str):
         return
     _processed.add(message_id)
 
-    # Keep processed set bounded
     if len(_processed) > 5000:
         oldest = list(_processed)[:1000]
         for m in oldest:
@@ -314,6 +379,13 @@ async def process_message(message_id: str):
             return
 
         email_data = parse_message(msg)
+
+        # Resolve short links — zero token cost, runs concurrently
+        short_links = [l for l in email_data["links"] if is_short_link(l.get("fullUrl", ""))]
+        if short_links:
+            log.info("Resolving %d short link(s) in message %s", len(short_links), message_id)
+            email_data["links"] = await resolve_short_links(email_data["links"])
+
         log.info("Processing: [%s] from %s", email_data["subject"][:60], email_data["sender"][:60])
 
         result = await analyze_with_shield(client, email_data)
@@ -321,7 +393,6 @@ async def process_message(message_id: str):
             log.warning("No Shield result for %s — skipping tag", message_id)
             return
 
-        # Edge function returns { verdict, action, summary } directly
         verdict = result.get("verdict", "SAFE")
         action  = result.get("action", "delivered")
         summary = result.get("summary", "")
@@ -330,7 +401,6 @@ async def process_message(message_id: str):
 
         await tag_email(client, message_id, verdict, result)
 
-        # Mark as read so the polling loop doesn't pick it up again
         try:
             await graph_patch(client, f"/users/{MAILBOX}/messages/{message_id}", {"isRead": True})
         except Exception as ex:
@@ -382,7 +452,6 @@ async def mailbox_poll_loop():
       2. Set POLL_INTERVAL_SECONDS=0 in your container env vars
       3. The webhook endpoint at /webhook/graph takes over
     """
-    # Brief startup delay to let the app finish initialising
     await asyncio.sleep(5)
     log.info("Poll loop started — interval %ds, mailbox: %s", POLL_INTERVAL_SECS, MAILBOX)
     while True:
