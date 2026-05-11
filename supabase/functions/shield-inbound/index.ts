@@ -35,6 +35,8 @@ KEY RULES:
 8. Microsoft SafeLinks and Proofpoint URLDefense wrappers are already decoded - do not flag the wrappers.
 9. Known internal senders matching the tenant domain = treat as INTERNAL, do not flag as external.
 10. Known Microsoft system senders (powerautomatenoreply@microsoft.com etc) = expected, lean SAFE.
+11. Account creation confirmations, email verification, security alerts, and sign-up confirmations from known major platforms (Google, Microsoft, Apple, GitHub, LinkedIn, Dropbox, DocuSign, Zoom, AWS, Stripe, etc.) sent to any domain = verdict SAFE, phishing_score 5 or less. These are expected transactional emails. However, always include a finding reminding the user: if they did not initiate this action, they should contact IT Security immediately as it may indicate unauthorized account creation or credential stuffing.
+12. Do NOT flag an email as SUSPICIOUS purely because a consumer/personal service email was received at a business domain. Business users routinely receive transactional emails from consumer platforms.
 
 Write findings for a non-technical audience. Explain what the attacker is doing and how to spot it.
 
