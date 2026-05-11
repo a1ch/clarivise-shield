@@ -37,6 +37,7 @@ KEY RULES:
 10. Known Microsoft system senders (powerautomatenoreply@microsoft.com etc) = expected, lean SAFE.
 11. Account creation confirmations, email verification, security alerts, and sign-up confirmations from known major platforms (Google, Microsoft, Apple, GitHub, LinkedIn, Dropbox, DocuSign, Zoom, AWS, Stripe, etc.) sent to any domain = verdict SAFE, phishing_score 5 or less. These are expected transactional emails. However, always include a finding reminding the user: if they did not initiate this action, they should contact IT Security immediately as it may indicate unauthorized account creation or credential stuffing.
 12. Do NOT flag an email as SUSPICIOUS purely because a consumer/personal service email was received at a business domain. Business users routinely receive transactional emails from consumer platforms.
+13. Google-owned short link domains (c.gle, goo.gl, g.co) are legitimate URL shorteners used in official Google emails — do NOT treat them as suspicious or obfuscated. If present in an email that is otherwise legitimate, note them as an informational finding only (e.g. "This email uses Google's link shortener — this is normal for Google communications") and do not increase the phishing score on this basis alone.
 
 Write findings for a non-technical audience. Explain what the attacker is doing and how to spot it.
 
@@ -67,7 +68,6 @@ serve(async (req) => {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-  // Look up org by inbound webhook secret
   const { data: org, error: orgErr } = await supabase
     .from('shield_organizations')
     .select('*')
@@ -87,7 +87,7 @@ serve(async (req) => {
     attachments?: string[]; replyTo?: string; isExternal?: boolean; receivedAt?: string
   }
 
-  // ── Check allowlist - skip analysis if sender is trusted ──────────────────
+  // ── Check allowlist ───────────────────────────────────────────────────────
   const senderDomain = extractDomain(email.sender ?? '')
   const { data: allowed } = await supabase
     .from('shield_allowlist').select('id').eq('org_id', org.id)
@@ -98,7 +98,7 @@ serve(async (req) => {
     return json({ verdict: 'SAFE', action: 'delivered', reason: 'allowlisted' }, 200)
   }
 
-  // ── Check blocklist - auto-quarantine ─────────────────────────────────────
+  // ── Check blocklist ───────────────────────────────────────────────────────
   const { data: blocked } = await supabase
     .from('shield_blocklist').select('id').eq('org_id', org.id)
     .or(`value.eq.${email.sender},value.eq.${senderDomain}`).limit(1)
@@ -111,8 +111,6 @@ serve(async (req) => {
   }
 
   // ── Call Claude AI with prompt caching ────────────────────────────────────
-  // The system prompt is cached (cache_control: ephemeral) - costs 90% less on cache hits.
-  // Only the per-email user message is billed at full rate.
   const userPrompt = buildUserPrompt(email, org)
   const t0 = Date.now()
   let result: Record<string, unknown>
@@ -133,7 +131,7 @@ serve(async (req) => {
           {
             type: 'text',
             text: SYSTEM_PROMPT,
-            cache_control: { type: 'ephemeral' },  // <-- Caches this block: 90% off on subsequent calls
+            cache_control: { type: 'ephemeral' },
           }
         ],
         messages: [{ role: 'user', content: userPrompt }],
@@ -150,20 +148,17 @@ serve(async (req) => {
     result = JSON.parse(text.replace(/```json|```/g, '').trim())
   } catch (err) {
     console.error('AI analysis failed:', err)
-    // Fail open - deliver the email but log the error so admin can see it
     return json({ verdict: 'ERROR', action: 'delivered', error: (err as Error).message }, 200)
   }
 
   const responseTimeMs = Date.now() - t0
   const verdict = String(result.verdict ?? 'SAFE')
 
-  // ── Determine action based on verdict + org settings ─────────────────────
   let action = 'delivered'
   if (verdict === 'PHISHING') action = 'quarantined'
   else if (verdict === 'SPAM') action = 'junk'
   else if (verdict === 'SUSPICIOUS') action = 'tagged'
 
-  // Org can choose to quarantine SUSPICIOUS as well
   if (org.quarantine_threshold === 'SUSPICIOUS' && verdict === 'SUSPICIOUS') {
     action = 'quarantined'
   }
