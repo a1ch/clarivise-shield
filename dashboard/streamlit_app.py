@@ -417,7 +417,7 @@ def render_scans(svc: Client, org_id: str):
 <div class="scan-row">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;">
     <div style="flex:1;min-width:0;">
-      {badge}{score_str}
+      <span style="font-size:.88rem;">{badge}{score_str}</span>
       <span style="font-size:.9rem;font-weight:600;color:#e2e8f0;margin-left:.5rem;">{s.get('subject','(no subject)')}</span>
       <div style="font-size:.78rem;color:#94a3b8;margin-top:.15rem;">{s.get('sender','')}</div>
       <div style="font-size:.78rem;color:#64748b;margin-top:.25rem;">{s.get('summary','')}</div>
@@ -658,3 +658,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
