@@ -8,15 +8,16 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY:       ${{ secrets.ACR_LOGIN_SERVER }}
+  REGISTRY:       clarivise5cr.azurecr.io
+  ACR_NAME:       clarivise5cr
   IMAGE_NAME:     clarivise-shield-connector
   RESOURCE_GROUP: Clarivise5
   CONTAINER_APP:  clarivise5
+  SUBSCRIPTION:   8f6344c7-58ae-450d-8f77-cc3492a08c0c
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -25,27 +26,10 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Login to ACR
-        run: az acr login --name ${{ secrets.ACR_NAME }}
-
-      - name: Build and push Docker image
+      - name: Build image in ACR (no local Docker needed)
         run: |
-          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ./connector
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          az acr build --registry ${{ env.ACR_NAME }} --image ${{ env.IMAGE_NAME }}:${{ github.sha }} --image ${{ env.IMAGE_NAME }}:latest ./connector
 
       - name: Deploy to Azure Container Apps
         run: |
-          az containerapp update \
-            --name ${{ env.CONTAINER_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-      - name: Show container app URL
-        run: |
-          az containerapp show \
-            --name ${{ env.CONTAINER_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --query properties.configuration.ingress.fqdn \
-            --output tsv
+          az containerapp update --name ${{ env.CONTAINER_APP }} --resource-group ${{ env.RESOURCE_GROUP }} --subscription ${{ env.SUBSCRIPTION }} --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}

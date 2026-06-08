@@ -291,14 +291,34 @@ async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Op
 
 
 # ── Email tagging ──────────────────────────────────────────────────────────────
-WARNING_BANNER = """
-<div style="background:#fff3cd;border:2px solid #ffc107;border-radius:6px;padding:12px 16px;margin:0 0 16px;font-family:Arial,sans-serif;font-size:13px;color:#856404;">
-  <strong>⚠️ Clarivise Shield Warning</strong><br>
-  This email has been flagged as <strong>{verdict}</strong> by Clarivise Shield AI.
-  {summary}
-  <br><em>Do not click links or open attachments unless you are certain of the sender's identity.</em>
-</div>
-"""
+VERDICT_STYLES = {
+    "SAFE":       {"bg": "#e6f4ea", "border": "#28a745", "text": "#1e7e34", "icon": "✅", "label": "Safe"},
+    "SPAM":       {"bg": "#f1f3f5", "border": "#868e96", "text": "#495057", "icon": "\U0001F4E7", "label": "Spam"},
+    "SUSPICIOUS": {"bg": "#fff3cd", "border": "#ffc107", "text": "#856404", "icon": "⚠️", "label": "Suspicious"},
+    "PHISHING":   {"bg": "#f8d7da", "border": "#dc3545", "text": "#721c24", "icon": "\U0001F6D1", "label": "Phishing"},
+}
+REPORT_MARKER = "<!--clarivise-shield-report-->"
+
+
+def build_report_html(verdict: str, summary: str) -> str:
+    """Concise HTML report box injected at the top of an email body (every email)."""
+    s = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])
+    safe_summary = (summary or "No issues detected.").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        f'{REPORT_MARKER}'
+        f'<div style="background:{s["bg"]};border:1px solid {s["border"]};border-radius:6px;'
+        f'padding:10px 14px;margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;'
+        f'font-size:13px;line-height:1.45;color:{s["text"]};">'
+        f'<strong>{s["icon"]} Clarivise Shield &mdash; {s["label"]}</strong><br>'
+        f'{safe_summary}'
+        f'</div>'
+    )
+
+
+def build_report_text(verdict: str, summary: str) -> str:
+    """Plain-text fallback report for non-HTML emails."""
+    label = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])["label"]
+    return f"=== Clarivise Shield: {label} ===\n{summary or 'No issues detected.'}\n\n"
 
 SUBJECT_PREFIXES = {
     "SPAM":       "[SPAM] ",
@@ -308,11 +328,9 @@ SUBJECT_PREFIXES = {
 
 
 async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, result: dict):
-    """Modify the email subject and optionally body to reflect the Shield verdict."""
-    if verdict == "SAFE":
-        log.info("SAFE — no tagging needed for %s", message_id)
-        return
-
+    """Inject a concise Clarivise Shield report at the top of EVERY email body,
+    and prefix the subject for flagged verdicts (SPAM/SUSPICIOUS/PHISHING)."""
+    summary = result.get("summary", "")
     prefix  = SUBJECT_PREFIXES.get(verdict, "")
     updates = {}
 
@@ -320,33 +338,29 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
         msg = await graph_get(client, f"/users/{MAILBOX}/messages/{message_id}?$select=subject,body")
         current_subject = msg.get("subject", "")
 
-        if not current_subject.startswith(prefix):
+        if prefix and not current_subject.startswith(prefix):
             updates["subject"] = prefix + current_subject
 
-        if verdict == "PHISHING":
-            body_obj     = msg.get("body", {})
-            body_content = body_obj.get("content", "")
-            body_type    = body_obj.get("contentType", "text")
+        body_obj     = msg.get("body", {})
+        body_content = body_obj.get("content", "")
+        body_type    = body_obj.get("contentType", "text")
 
+        already_tagged = (REPORT_MARKER in body_content) or ("Clarivise Shield" in body_content)
+        if not already_tagged:
             if body_type == "html":
-                banner = WARNING_BANNER.format(
-                    verdict=verdict,
-                    summary=result.get("summary", "")[:200],
-                )
                 updates["body"] = {
                     "contentType": "html",
-                    "content":     banner + body_content,
+                    "content":     build_report_html(verdict, summary) + body_content,
                 }
             else:
-                warning = f"\n\n⚠️ CLARIVISE SHIELD WARNING: This email was flagged as PHISHING. {result.get('summary', '')}\n\n"
                 updates["body"] = {
                     "contentType": "text",
-                    "content":     warning + body_content,
+                    "content":     build_report_text(verdict, summary) + body_content,
                 }
 
         if updates:
             await graph_patch(client, f"/users/{MAILBOX}/messages/{message_id}", updates)
-            log.info("Tagged message %s as %s", message_id, verdict)
+            log.info("Reported message %s as %s", message_id, verdict)
 
     except Exception as ex:
         log.error("Failed to tag message %s: %s", message_id, ex)
