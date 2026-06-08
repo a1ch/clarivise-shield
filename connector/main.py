@@ -309,25 +309,57 @@ VERDICT_STYLES = {
 REPORT_MARKER = "<!--clarivise-shield-report-->"
 
 
-def build_report_html(verdict: str, summary: str) -> str:
-    """Concise HTML report box injected at the top of an email body (every email)."""
+def _esc(v) -> str:
+    return str(v if v is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_report_html(verdict: str, result: dict) -> str:
+    """Detailed HTML report: verdict, risk scores, summary, findings (warnings), suggested action."""
     s = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])
-    safe_summary = (summary or "No issues detected.").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    summary = _esc(result.get("summary") or "No issues detected.")
+    pscore  = result.get("phishing_score")
+    sscore  = result.get("spam_score")
+    score_html = ""
+    if pscore is not None or sscore is not None:
+        pv = pscore if pscore is not None else "?"
+        sv = sscore if sscore is not None else "?"
+        score_html = (f'<span style="float:right;font-weight:600;white-space:nowrap;">'
+                      f'Phishing {pv}/100 &middot; Spam {sv}/100</span>')
+    findings = result.get("findings") or []
+    findings_html = ""
+    if findings:
+        items = "".join(f'<li>{_esc(f.get("flag") if isinstance(f, dict) else f)}</li>' for f in findings[:4])
+        findings_html = (f'<div style="margin-top:8px;"><strong>Why it was flagged:</strong>'
+                         f'<ul style="margin:4px 0 0 18px;padding:0;">{items}</ul></div>')
+    action = result.get("suggested_action")
+    action_html = f'<div style="margin-top:6px;"><strong>What to do:</strong> {_esc(action)}</div>' if action else ""
     return (
         f'{REPORT_MARKER}'
         f'<div style="background:{s["bg"]};border:1px solid {s["border"]};border-radius:6px;'
         f'padding:10px 14px;margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;'
         f'font-size:13px;line-height:1.45;color:{s["text"]};">'
-        f'<strong>{s["icon"]} Clarivise Shield &mdash; {s["label"]}</strong><br>'
-        f'{safe_summary}'
+        f'<strong>{s["icon"]} Clarivise Shield &mdash; {s["label"]}</strong>{score_html}<br>'
+        f'{summary}{findings_html}{action_html}'
         f'</div>'
     )
 
 
-def build_report_text(verdict: str, summary: str) -> str:
+def build_report_text(verdict: str, result: dict) -> str:
     """Plain-text fallback report for non-HTML emails."""
-    label = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])["label"]
-    return f"=== Clarivise Shield: {label} ===\n{summary or 'No issues detected.'}\n\n"
+    label  = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])["label"]
+    pscore = result.get("phishing_score")
+    sscore = result.get("spam_score")
+    lines  = [f"=== Clarivise Shield: {label} ==="]
+    if pscore is not None or sscore is not None:
+        lines.append(f"Phishing {pscore}/100 | Spam {sscore}/100")
+    lines.append(result.get("summary") or "No issues detected.")
+    findings = result.get("findings") or []
+    if findings:
+        flags = "; ".join(str(f.get("flag") if isinstance(f, dict) else f) for f in findings[:4])
+        lines.append("Why: " + flags)
+    if result.get("suggested_action"):
+        lines.append("Do: " + str(result.get("suggested_action")))
+    return "\n".join(lines) + "\n\n"
 
 SUBJECT_PREFIXES = {
     "SPAM":       "[SPAM] ",
@@ -359,12 +391,12 @@ async def tag_email(client: httpx.AsyncClient, mailbox: str, message_id: str, ve
             if body_type == "html":
                 updates["body"] = {
                     "contentType": "html",
-                    "content":     build_report_html(verdict, summary) + body_content,
+                    "content":     build_report_html(verdict, result) + body_content,
                 }
             else:
                 updates["body"] = {
                     "contentType": "text",
-                    "content":     build_report_text(verdict, summary) + body_content,
+                    "content":     build_report_text(verdict, result) + body_content,
                 }
 
         if updates:
@@ -423,6 +455,9 @@ async def process_message(mailbox: str, message_id: str):
 
         log.info("Verdict: %s | Action: %s | %s", verdict, action, summary[:80])
 
+        if verdict not in ("SAFE", "SPAM", "SUSPICIOUS", "PHISHING"):
+            log.warning("Scan returned %s (AI unavailable / error) — NOT injecting a banner for %s", verdict, message_id)
+            return
         await tag_email(client, mailbox, message_id, verdict, result)
 
         try:

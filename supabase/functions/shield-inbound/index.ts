@@ -33,7 +33,7 @@ KEY RULES:
 6. High-risk attachments (.exe, .js, .ps1, .hta, .vbs) = PHISHING.
 7. Urgent credential requests or login links = at minimum SUSPICIOUS.
 8. Microsoft SafeLinks and Proofpoint URLDefense wrappers are already decoded - do not flag the wrappers.
-9. Known internal senders matching the tenant domain = treat as INTERNAL, do not flag as external.
+9. Internal senders (matching the tenant domain) must not be flagged SOLELY for being internal/external - that trust ONLY suppresses unknown-external-sender suspicion. It NEVER overrides content threats. The hard rules above (1 gift cards, 2 brand impersonation, 4 lookalike domains, 5/6 dangerous attachments, 7 credential/login requests) ALWAYS apply regardless of who sent it. CRITICAL: an internal-looking sender that exhibits phishing behavior (gift card asks, password/credential/login-link requests, lookalike or external action links, urgency to act) almost always means a COMPROMISED or SPOOFED internal account - classify as PHISHING (minimum SUSPICIOUS), set phishing_score accordingly, and add a finding warning that the internal account may be compromised or its address spoofed and to verify out-of-band before acting.
 10. Known Microsoft system senders (powerautomatenoreply@microsoft.com etc) = expected, lean SAFE.
 11. Account creation confirmations, email verification, security alerts, and sign-up confirmations from known major platforms (Google, Microsoft, Apple, GitHub, LinkedIn, Dropbox, DocuSign, Zoom, AWS, Stripe, etc.) sent to any domain = verdict SAFE, phishing_score 5 or less. These are expected transactional emails. However, always include a finding reminding the user: if they did not initiate this action, they should contact IT Security immediately as it may indicate unauthorized account creation or credential stuffing.
 12. Do NOT flag an email as SUSPICIOUS purely because a consumer/personal service email was received at a business domain. Business users routinely receive transactional emails from consumer platforms.
@@ -95,7 +95,7 @@ serve(async (req) => {
 
   if (allowed && allowed.length > 0) {
     await logScan(supabase, org.id, email, { verdict: 'SAFE', phishing_score: 0, spam_score: 0, summary: 'Sender is on your organization allowlist.', findings: [], suggested_action: 'No action needed.' }, 'delivered', 0)
-    return json({ verdict: 'SAFE', action: 'delivered', reason: 'allowlisted' }, 200)
+    return json({ verdict: 'SAFE', action: 'delivered', reason: 'allowlisted', summary: 'Sender is on your organization allowlist.', phishing_score: 0, spam_score: 0, findings: [], suggested_action: 'No action needed.' }, 200)
   }
 
   // ── Check blocklist ───────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ serve(async (req) => {
     const blockedResult = { verdict: 'PHISHING', phishing_score: 99, spam_score: 0, summary: 'Sender is on your organization blocklist.', findings: [{ flag: 'Blocked sender', explanation: 'This sender has been manually blocked by your IT security team.', howToSpotIt: 'Contact IT if you believe this is an error.' }], suggested_action: 'Email quarantined - sender is on blocklist.' }
     await logScan(supabase, org.id, email, blockedResult, 'quarantined', 0)
     await addToQuarantine(supabase, org.id, email, blockedResult)
-    return json({ verdict: 'PHISHING', action: 'quarantined', reason: 'blocklisted' }, 200)
+    return json({ verdict: 'PHISHING', action: 'quarantined', reason: 'blocklisted', summary: blockedResult.summary, phishing_score: 99, spam_score: 0, findings: blockedResult.findings, suggested_action: blockedResult.suggested_action }, 200)
   }
 
   // ── Call Claude AI with prompt caching ────────────────────────────────────
@@ -166,7 +166,7 @@ serve(async (req) => {
   await logScan(supabase, org.id, email, result, action, responseTimeMs)
   if (action === 'quarantined') await addToQuarantine(supabase, org.id, email, result)
 
-  return json({ verdict, action, summary: result.summary }, 200)
+  return json({ verdict, action, summary: result.summary, phishing_score: result.phishing_score, spam_score: result.spam_score, findings: result.findings, suggested_action: result.suggested_action }, 200)
 })
 
 // ── Helpers ───────────────────────────────────────────────────────────────────────────────────
