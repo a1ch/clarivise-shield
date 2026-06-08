@@ -57,6 +57,13 @@ SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
 ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
 POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+# Multi-mailbox: comma-separated list to scan; falls back to single SHIELD_MAILBOX.
+MAILBOXES           = [m.strip() for m in os.environ.get("SHIELD_MAILBOXES", MAILBOX).split(",") if m.strip()]
+# Real-inbox safety: do not rewrite subjects, do not mark mail read (both default off).
+TAG_SUBJECT         = os.environ.get("SHIELD_TAG_SUBJECT", "false").lower() == "true"
+MARK_READ           = os.environ.get("SHIELD_MARK_READ", "false").lower() == "true"
+# Only scan mail that arrives after the connector starts (set at startup) — never the backlog.
+SCAN_AFTER_ISO      = None
 
 GRAPH_BASE     = "https://graph.microsoft.com/v1.0"
 TOKEN_URL      = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
@@ -83,6 +90,8 @@ SHORT_LINK_DOMAINS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background polling loop on startup; cancel on shutdown."""
+    global SCAN_AFTER_ISO
+    SCAN_AFTER_ISO = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     poll_task = None
     if POLL_INTERVAL_SECS > 0:
         log.info("Starting mailbox polling loop (interval: %ds)", POLL_INTERVAL_SECS)
@@ -327,15 +336,15 @@ SUBJECT_PREFIXES = {
 }
 
 
-async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, result: dict):
+async def tag_email(client: httpx.AsyncClient, mailbox: str, message_id: str, verdict: str, result: dict):
     """Inject a concise Clarivise Shield report at the top of EVERY email body,
     and prefix the subject for flagged verdicts (SPAM/SUSPICIOUS/PHISHING)."""
     summary = result.get("summary", "")
-    prefix  = SUBJECT_PREFIXES.get(verdict, "")
+    prefix  = SUBJECT_PREFIXES.get(verdict, "") if TAG_SUBJECT else ""
     updates = {}
 
     try:
-        msg = await graph_get(client, f"/users/{MAILBOX}/messages/{message_id}?$select=subject,body")
+        msg = await graph_get(client, f"/users/{mailbox}/messages/{message_id}?$select=subject,body")
         current_subject = msg.get("subject", "")
 
         if prefix and not current_subject.startswith(prefix):
@@ -359,7 +368,7 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
                 }
 
         if updates:
-            await graph_patch(client, f"/users/{MAILBOX}/messages/{message_id}", updates)
+            await graph_patch(client, f"/users/{mailbox}/messages/{message_id}", updates)
             log.info("Reported message %s as %s", message_id, verdict)
 
     except Exception as ex:
@@ -367,12 +376,13 @@ async def tag_email(client: httpx.AsyncClient, message_id: str, verdict: str, re
 
 
 # ── Core processing ────────────────────────────────────────────────────────────
-async def process_message(message_id: str):
+async def process_message(mailbox: str, message_id: str):
     """Fetch, analyze, and tag a single email message."""
-    if message_id in _processed:
+    key = f"{mailbox}:{message_id}"
+    if key in _processed:
         log.debug("Already processed %s — skipping", message_id)
         return
-    _processed.add(message_id)
+    _processed.add(key)
 
     if len(_processed) > 5000:
         oldest = list(_processed)[:1000]
@@ -383,13 +393,13 @@ async def process_message(message_id: str):
         try:
             msg = await graph_get(
                 client,
-                f"/users/{MAILBOX}/messages/{message_id}"
+                f"/users/{mailbox}/messages/{message_id}"
                 "?$select=id,subject,from,toRecipients,body,replyTo,receivedDateTime,attachments"
                 "&$expand=attachments($select=name,contentType)",
             )
         except Exception as ex:
             log.error("Failed to fetch message %s: %s", message_id, ex)
-            _processed.discard(message_id)
+            _processed.discard(key)
             return
 
         email_data = parse_message(msg)
@@ -413,16 +423,17 @@ async def process_message(message_id: str):
 
         log.info("Verdict: %s | Action: %s | %s", verdict, action, summary[:80])
 
-        await tag_email(client, message_id, verdict, result)
+        await tag_email(client, mailbox, message_id, verdict, result)
 
         try:
-            await graph_patch(client, f"/users/{MAILBOX}/messages/{message_id}", {"isRead": True})
+            if MARK_READ:
+                await graph_patch(client, f"/users/{mailbox}/messages/{message_id}", {"isRead": True})
         except Exception as ex:
             log.warning("Could not mark message %s as read: %s", message_id, ex)
 
 
 # ── Option B: Mailbox polling loop ─────────────────────────────────────────────
-async def poll_mailbox_once():
+async def poll_mailbox_once(mailbox: str):
     """
     Fetch all unread messages from the shared mailbox and enqueue them for processing.
     Messages are marked as read inside process_message() after a successful scan,
@@ -432,8 +443,8 @@ async def poll_mailbox_once():
         try:
             data = await graph_get(
                 client,
-                f"/users/{MAILBOX}/messages"
-                "?$filter=isRead eq false"
+                f"/users/{mailbox}/messages"
+                f"?$filter=receivedDateTime ge {SCAN_AFTER_ISO}"
                 "&$select=id,subject,from,receivedDateTime"
                 "&$orderby=receivedDateTime asc"
                 "&$top=50",
@@ -451,9 +462,9 @@ async def poll_mailbox_once():
         for msg in messages:
             message_id = msg.get("id")
             subject    = msg.get("subject", "")[:60]
-            if message_id and message_id not in _processed:
+            if message_id and f"{mailbox}:{message_id}" not in _processed:
                 log.info("Poll: queuing message [%s]", subject)
-                asyncio.create_task(process_message(message_id))
+                asyncio.create_task(process_message(mailbox, message_id))
 
 
 async def mailbox_poll_loop():
@@ -467,10 +478,11 @@ async def mailbox_poll_loop():
       3. The webhook endpoint at /webhook/graph takes over
     """
     await asyncio.sleep(5)
-    log.info("Poll loop started — interval %ds, mailbox: %s", POLL_INTERVAL_SECS, MAILBOX)
+    log.info("Poll loop started — interval %ds, mailboxes: %s", POLL_INTERVAL_SECS, ", ".join(MAILBOXES))
     while True:
         try:
-            await poll_mailbox_once()
+            for _mbox in MAILBOXES:
+                await poll_mailbox_once(_mbox)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
@@ -493,15 +505,17 @@ async def health():
 @app.post("/webhook/reprocess/{message_id}")
 async def reprocess(message_id: str, background_tasks: BackgroundTasks):
     """Manually reprocess a specific message — useful for testing."""
-    _processed.discard(message_id)
-    background_tasks.add_task(process_message, message_id)
+    _mbox = MAILBOXES[0]
+    _processed.discard(f"{_mbox}:{message_id}")
+    background_tasks.add_task(process_message, _mbox, message_id)
     return {"queued": message_id}
 
 
 @app.post("/poll/now")
 async def poll_now():
     """Trigger an immediate poll of the mailbox — useful for testing without waiting."""
-    asyncio.create_task(poll_mailbox_once())
+    for _mbox in MAILBOXES:
+        asyncio.create_task(poll_mailbox_once(_mbox))
     return {"status": "poll triggered"}
 
 
@@ -548,7 +562,7 @@ async def graph_webhook(request: Request, background_tasks: BackgroundTasks):
 
         if change_type == "created" and message_id:
             log.info("New message notification: %s", message_id)
-            background_tasks.add_task(process_message, message_id)
+            background_tasks.add_task(process_message, _mbox, message_id)
 
     return Response(status_code=202)
 
