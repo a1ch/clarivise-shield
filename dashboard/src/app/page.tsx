@@ -29,20 +29,50 @@ async function api(path: string, token: string, method = 'GET', body?: unknown) 
   return res.json()
 }
 
+async function authPost(path: string, body: unknown) {
+  const res = await fetch(ADMIN_API + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return res.json()
+}
+
 export default function Dashboard() {
+  const [email, setEmail]           = useState('')
+  const [code, setCode]             = useState('')
+  const [step, setStep]             = useState<'email' | 'code'>('email')
   const [token, setToken]           = useState('')
   const [authed, setAuthed]         = useState(false)
+  const [err, setErr]               = useState('')
   const [tab, setTab]               = useState<'overview'|'scans'|'quarantine'|'settings'>('overview')
   const [stats, setStats]           = useState<Stats | null>(null)
   const [scans, setScans]           = useState<Scan[]>([])
   const [quarantine, setQuarantine] = useState<QuarantineItem[]>([])
   const [loading, setLoading]       = useState(false)
 
-  async function login() {
-    setLoading(true)
-    const data = await api('/stats', token)
-    if (data.total_scanned !== undefined) { setAuthed(true); setStats(data) }
-    else alert('Invalid credentials')
+  async function requestCode() {
+    setErr(''); setLoading(true)
+    try {
+      await authPost('/login', { email: email.trim().toLowerCase() })
+      setStep('code')
+    } catch { setErr('Could not send code. Try again.') }
+    setLoading(false)
+  }
+
+  async function verifyCode() {
+    setErr(''); setLoading(true)
+    try {
+      const data = await authPost('/verify', { email: email.trim().toLowerCase(), code: code.trim() })
+      if (data.token) {
+        setToken(data.token)
+        setAuthed(true)
+        const s = await api('/stats', data.token)
+        if (s.total_scanned !== undefined) setStats(s)
+      } else {
+        setErr(data.error || 'Invalid code')
+      }
+    } catch { setErr('Verification failed. Try again.') }
     setLoading(false)
   }
 
@@ -55,7 +85,7 @@ export default function Dashboard() {
   }
 
   async function releaseEmail(id: string) {
-    await api(`/quarantine/${id}/release`, token, 'POST', { notes: 'Released by admin' })
+    await api(`/quarantine/${id}/release`, token, 'POST', { notes: 'Reviewed by admin' })
     setQuarantine(q => q.filter(e => e.id !== id))
   }
   async function deleteEmail(id: string) {
@@ -73,9 +103,22 @@ export default function Dashboard() {
           <Shield className="text-[#2E75B6]" size={32} />
           <div><h1 className="text-xl font-bold text-white">Clarivise Shield</h1><p className="text-sm text-slate-400">Admin Dashboard</p></div>
         </div>
-        <label className="block text-sm text-slate-400 mb-2">Admin Email</label>
-        <input className="w-full bg-[#0f1f33] border border-[#2E75B6]/40 rounded-lg px-4 py-3 text-white text-sm mb-6 focus:outline-none focus:border-[#2E75B6]" placeholder="admin@yourcompany.com" value={token} onChange={e => setToken(e.target.value)} onKeyDown={e => e.key === 'Enter' && login()} />
-        <button onClick={login} disabled={loading} className="w-full bg-[#2E75B6] hover:bg-[#1F4E79] text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50">{loading ? 'Signing in...' : 'Sign In'}</button>
+        {step === 'email' ? (
+          <>
+            <label className="block text-sm text-slate-400 mb-2">Admin Email</label>
+            <input className="w-full bg-[#0f1f33] border border-[#2E75B6]/40 rounded-lg px-4 py-3 text-white text-sm mb-4 focus:outline-none focus:border-[#2E75B6]" placeholder="admin@yourcompany.com" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && requestCode()} />
+            {err && <p className="text-red-400 text-xs mb-3">{err}</p>}
+            <button onClick={requestCode} disabled={loading || !email} className="w-full bg-[#2E75B6] hover:bg-[#1F4E79] text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50">{loading ? 'Sending...' : 'Send sign-in code'}</button>
+          </>
+        ) : (
+          <>
+            <label className="block text-sm text-slate-400 mb-2">Enter the 6-digit code sent to <span className="text-slate-200">{email}</span></label>
+            <input className="w-full bg-[#0f1f33] border border-[#2E75B6]/40 rounded-lg px-4 py-3 text-white text-lg tracking-widest text-center mb-4 focus:outline-none focus:border-[#2E75B6]" placeholder="000000" maxLength={6} inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ''))} onKeyDown={e => e.key === 'Enter' && verifyCode()} />
+            {err && <p className="text-red-400 text-xs mb-3">{err}</p>}
+            <button onClick={verifyCode} disabled={loading || code.length < 6} className="w-full bg-[#2E75B6] hover:bg-[#1F4E79] text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50 mb-3">{loading ? 'Verifying...' : 'Verify & sign in'}</button>
+            <button onClick={() => { setStep('email'); setCode(''); setErr('') }} className="w-full text-slate-400 hover:text-white text-xs">Use a different email / resend</button>
+          </>
+        )}
       </div>
     </div>
   )
@@ -85,10 +128,10 @@ export default function Dashboard() {
       <aside className="w-56 bg-[#1a3050] border-r border-[#2E75B6]/20 flex flex-col py-6 px-4 flex-shrink-0">
         <div className="flex items-center gap-2 mb-8 px-2"><Shield className="text-[#2E75B6]" size={22} /><span className="font-bold text-white text-sm">Clarivise Shield</span></div>
         {[
-          { id: 'overview',   label: 'Overview',   icon: <CheckCircle size={16} /> },
-          { id: 'scans',      label: 'Scan Log',   icon: <List size={16} /> },
-          { id: 'quarantine', label: 'Quarantine', icon: <Inbox size={16} /> },
-          { id: 'settings',   label: 'Settings',   icon: <Settings size={16} /> },
+          { id: 'overview',   label: 'Overview',     icon: <CheckCircle size={16} /> },
+          { id: 'scans',      label: 'Scan Log',     icon: <List size={16} /> },
+          { id: 'quarantine', label: 'Review Queue', icon: <Inbox size={16} /> },
+          { id: 'settings',   label: 'Settings',     icon: <Settings size={16} /> },
         ].map(item => (
           <button key={item.id} onClick={() => loadTab(item.id as typeof tab)}
             className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium mb-1 transition-colors ${tab === item.id ? 'bg-[#2E75B6] text-white' : 'text-slate-400 hover:text-white hover:bg-[#2E75B6]/20'}`}>
@@ -106,10 +149,10 @@ export default function Dashboard() {
             <h2 className="text-2xl font-bold text-white mb-6">Overview - Last 30 Days</h2>
             <div className="grid grid-cols-4 gap-4 mb-8">
               {[
-                { label: 'Emails Scanned',     value: stats.total_scanned,     icon: <CheckCircle size={20} />,   color: 'text-blue-400' },
-                { label: 'Quarantine Pending', value: stats.quarantine_pending, icon: <Inbox size={20} />,         color: 'text-red-400' },
-                { label: 'Threat Rate',        value: `${stats.threat_rate}%`, icon: <AlertTriangle size={20} />, color: 'text-orange-400' },
-                { label: 'Phishing Caught',    value: stats.verdicts.PHISHING, icon: <XCircle size={20} />,       color: 'text-red-400' },
+                { label: 'Emails Scanned',  value: stats.total_scanned,     icon: <CheckCircle size={20} />,   color: 'text-blue-400' },
+                { label: 'Flagged Pending', value: stats.quarantine_pending, icon: <Inbox size={20} />,         color: 'text-red-400' },
+                { label: 'Threat Rate',     value: `${stats.threat_rate}%`, icon: <AlertTriangle size={20} />, color: 'text-orange-400' },
+                { label: 'Phishing Caught', value: stats.verdicts.PHISHING, icon: <XCircle size={20} />,       color: 'text-red-400' },
               ].map(card => (
                 <div key={card.label} className="bg-[#1a3050] rounded-xl p-5 border border-[#2E75B6]/20">
                   <div className={`${card.color} mb-2`}>{card.icon}</div>
@@ -155,7 +198,8 @@ export default function Dashboard() {
 
         {tab === 'quarantine' && (
           <div>
-            <h2 className="text-2xl font-bold text-white mb-6">Quarantine Queue</h2>
+            <h2 className="text-2xl font-bold text-white mb-6">Review Queue</h2>
+            <p className="text-slate-400 text-sm mb-4">Flagged messages for review. Mail was delivered and tagged (marking mode) - these are not held out of the inbox.</p>
             <div className="space-y-3">
               {quarantine.map(item => (
                 <div key={item.id} className="bg-[#1a3050] rounded-xl p-5 border border-red-800/40">
@@ -170,13 +214,13 @@ export default function Dashboard() {
                       <div className="text-xs text-slate-500 mt-2">{item.summary}</div>
                     </div>
                     <div className="flex gap-2 flex-shrink-0">
-                      <button onClick={() => releaseEmail(item.id)} className="px-3 py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs font-semibold rounded-lg transition-colors">Release</button>
-                      <button onClick={() => deleteEmail(item.id)} className="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white text-xs font-semibold rounded-lg transition-colors">Delete</button>
+                      <button onClick={() => releaseEmail(item.id)} className="px-3 py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs font-semibold rounded-lg transition-colors">Mark reviewed</button>
+                      <button onClick={() => deleteEmail(item.id)} className="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white text-xs font-semibold rounded-lg transition-colors">Dismiss</button>
                     </div>
                   </div>
                 </div>
               ))}
-              {quarantine.length === 0 && !loading && <p className="text-slate-500 text-sm">Quarantine is empty.</p>}
+              {quarantine.length === 0 && !loading && <p className="text-slate-500 text-sm">Review queue is empty.</p>}
             </div>
           </div>
         )}
