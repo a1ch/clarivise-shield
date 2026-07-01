@@ -305,11 +305,12 @@ async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Op
 
 # ── Email tagging ──────────────────────────────────────────────────────────────
 VERDICT_STYLES = {
-    "SAFE":       {"bg": "#e6f4ea", "border": "#28a745", "text": "#1e7e34", "icon": "✅", "label": "Safe"},
-    "SPAM":       {"bg": "#f1f3f5", "border": "#868e96", "text": "#495057", "icon": "\U0001F4E7", "label": "Spam"},
-    "SUSPICIOUS": {"bg": "#fff8e6", "border": "#e0a800", "text": "#5c4600", "icon": "⚠️", "label": "Suspicious"},
-    "PHISHING":   {"bg": "#f8d7da", "border": "#dc3545", "text": "#721c24", "icon": "\U0001F6D1", "label": "Phishing"},
+    "SAFE":       {"accent": "#1a9e5f", "soft": "#eef9f2", "ink": "#0f5132", "icon": "✔", "label": "Safe"},
+    "SPAM":       {"accent": "#6b7280", "soft": "#f3f4f6", "ink": "#374151", "icon": "✉", "label": "Spam"},
+    "SUSPICIOUS": {"accent": "#c77800", "soft": "#fff7e8", "ink": "#7a3d00", "icon": "⚠", "label": "Suspicious"},
+    "PHISHING":   {"accent": "#d92d20", "soft": "#fdeceb", "ink": "#7a1710", "icon": "⛔", "label": "Phishing"},
 }
+
 REPORT_MARKER = "<!--clarivise-shield-report-->"
 
 
@@ -318,32 +319,50 @@ def _esc(v) -> str:
 
 
 def build_report_html(verdict: str, result: dict) -> str:
-    """Detailed HTML report: verdict, risk scores, summary, findings (warnings), suggested action."""
+    """Clean, high-contrast Clarivise Shield report card."""
     s = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])
     summary = _esc(result.get("summary") or "No issues detected.")
-    pscore  = result.get("phishing_score")
-    sscore  = result.get("spam_score")
-    score_html = ""
+    pscore = result.get("phishing_score")
+    sscore = result.get("spam_score")
+
+    scores_html = ""
     if pscore is not None or sscore is not None:
         pv = pscore if pscore is not None else "?"
         sv = sscore if sscore is not None else "?"
-        score_html = (f'<span style="float:right;font-weight:600;white-space:nowrap;">'
-                      f'Phishing {pv}/100 &middot; Spam {sv}/100</span>')
+        scores_html = (
+            f'<span style="display:inline-block;font-size:12px;font-weight:700;'
+            f'color:{s["accent"]};border:1px solid {s["accent"]};border-radius:999px;'
+            f'padding:2px 10px;white-space:nowrap;">Phishing {pv} &middot; Spam {sv}</span>'
+        )
+
     findings = result.get("findings") or []
     findings_html = ""
     if findings:
-        items = "".join(f'<li>{_esc(f.get("flag") if isinstance(f, dict) else f)}</li>' for f in findings[:4])
-        findings_html = (f'<div style="margin-top:8px;"><strong>Why it was flagged:</strong>'
-                         f'<ul style="margin:4px 0 0 18px;padding:0;">{items}</ul></div>')
+        rows = "".join(
+            f'<tr><td style="vertical-align:top;color:{s["accent"]};font-weight:700;padding:1px 8px 1px 0;">&bull;</td>'
+            f'<td style="padding:1px 0;color:{s["ink"]};">{_esc(f.get("flag") if isinstance(f, dict) else f)}</td></tr>'
+            for f in findings[:4]
+        )
+        findings_html = (
+            f'<div style="margin-top:12px;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:{s["accent"]};">Why it was flagged</div>'
+            f'<table role="presentation" style="border-collapse:collapse;margin-top:4px;">{rows}</table>'
+        )
+
     action = result.get("suggested_action")
-    action_html = f'<div style="margin-top:6px;"><strong>What to do:</strong> {_esc(action)}</div>' if action else ""
+    action_html = ""
+    if action:
+        action_html = (
+            f'<div style="margin-top:12px;padding:8px 12px;border-left:3px solid {s["accent"]};background:rgba(0,0,0,0.03);border-radius:4px;color:{s["ink"]};"><b>What to do:</b> {_esc(action)}</div>'
+        )
+
     return (
         f'{REPORT_MARKER}'
-        f'<div style="background:{s["bg"]};border:1px solid {s["border"]};border-radius:6px;'
-        f'padding:10px 14px;margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;'
-        f'font-size:13px;line-height:1.45;color:{s["text"]};">'
-        f'<strong>{s["icon"]} Clarivise Shield &mdash; {s["label"]}</strong>{score_html}<br>'
-        f'{summary}{findings_html}{action_html}'
+        f'<div style="max-width:640px;border:1px solid {s["accent"]};border-left:5px solid {s["accent"]};border-radius:10px;background:{s["soft"]};color:{s["ink"]};font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;padding:14px 18px;margin:0 0 18px;">'
+        f'<table role="presentation" style="width:100%;border-collapse:collapse;"><tr>'
+        f'<td style="font-size:15px;font-weight:800;color:{s["accent"]};">{s["icon"]} Clarivise Shield &mdash; {s["label"]}</td>'
+        f'<td style="text-align:right;vertical-align:top;">{scores_html}</td></tr></table>'
+        f'<div style="margin-top:8px;color:{s["ink"]};">{summary}</div>'
+        f'{findings_html}{action_html}'
         f'</div>'
     )
 
