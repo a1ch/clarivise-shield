@@ -305,10 +305,10 @@ async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Op
 
 # ── Email tagging ──────────────────────────────────────────────────────────────
 VERDICT_STYLES = {
-    "SAFE":       {"accent": "#1a9e5f", "soft": "#eef9f2", "ink": "#0f5132", "icon": "✔", "label": "Safe"},
-    "SPAM":       {"accent": "#6b7280", "soft": "#f3f4f6", "ink": "#374151", "icon": "✉", "label": "Spam"},
-    "SUSPICIOUS": {"accent": "#c77800", "soft": "#fff7e8", "ink": "#7a3d00", "icon": "⚠", "label": "Suspicious"},
-    "PHISHING":   {"accent": "#d92d20", "soft": "#fdeceb", "ink": "#7a1710", "icon": "⛔", "label": "Phishing"},
+    "SAFE":       {"accent": "#22c55e", "soft": "#eef9f2", "ink": "#0f5132", "icon": "✔", "label": "Safe"},
+    "SPAM":       {"accent": "#94a3b8", "soft": "#f3f4f6", "ink": "#374151", "icon": "✉", "label": "Spam"},
+    "SUSPICIOUS": {"accent": "#f59e0b", "soft": "#fff7e8", "ink": "#7a3d00", "icon": "⚠", "label": "Suspicious"},
+    "PHISHING":   {"accent": "#ef4444", "soft": "#fdeceb", "ink": "#7a1710", "icon": "⛔", "label": "Phishing"},
 }
 
 REPORT_MARKER = "<!--clarivise-shield-report-->"
@@ -319,8 +319,9 @@ def _esc(v) -> str:
 
 
 def build_report_html(verdict: str, result: dict) -> str:
-    """Clean, high-contrast Clarivise Shield report card."""
+    """Theme-agnostic report: colored left rule + accent headings; body text inherits (light/dark safe)."""
     s = VERDICT_STYLES.get(verdict, VERDICT_STYLES["SAFE"])
+    a = s["accent"]
     summary = _esc(result.get("summary") or "No issues detected.")
     pscore = result.get("phishing_score")
     sscore = result.get("spam_score")
@@ -330,38 +331,37 @@ def build_report_html(verdict: str, result: dict) -> str:
         pv = pscore if pscore is not None else "?"
         sv = sscore if sscore is not None else "?"
         scores_html = (
-            f'<span style="display:inline-block;font-size:12px;font-weight:700;'
-            f'color:{s["accent"]};border:1px solid {s["accent"]};border-radius:999px;'
-            f'padding:2px 10px;white-space:nowrap;">Phishing {pv} &middot; Spam {sv}</span>'
+            f'<span style="display:inline-block;font-size:12px;font-weight:700;color:{a};'
+            f'border:1px solid {a};border-radius:999px;padding:1px 10px;white-space:nowrap;">'
+            f'Phishing {pv} &middot; Spam {sv}</span>'
         )
 
     findings = result.get("findings") or []
     findings_html = ""
     if findings:
         rows = "".join(
-            f'<tr><td style="vertical-align:top;color:{s["accent"]};font-weight:700;padding:1px 8px 1px 0;">&bull;</td>'
-            f'<td style="padding:1px 0;color:{s["ink"]};">{_esc(f.get("flag") if isinstance(f, dict) else f)}</td></tr>'
+            f'<tr><td style="vertical-align:top;color:{a};font-weight:700;padding:1px 8px 1px 0;line-height:1.5;">&bull;</td>'
+            f'<td style="padding:1px 0;line-height:1.5;">{_esc(f.get("flag") if isinstance(f, dict) else f)}</td></tr>'
             for f in findings[:4]
         )
         findings_html = (
-            f'<div style="margin-top:12px;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:{s["accent"]};">Why it was flagged</div>'
-            f'<table role="presentation" style="border-collapse:collapse;margin-top:4px;">{rows}</table>'
+            f'<div style="margin-top:12px;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:{a};">Why it was flagged</div>'
+            f'<table role="presentation" style="border-collapse:collapse;margin-top:3px;">{rows}</table>'
         )
 
     action = result.get("suggested_action")
     action_html = ""
     if action:
-        action_html = (
-            f'<div style="margin-top:12px;padding:8px 12px;border-left:3px solid {s["accent"]};background:rgba(0,0,0,0.03);border-radius:4px;color:{s["ink"]};"><b>What to do:</b> {_esc(action)}</div>'
-        )
+        action_html = f'<div style="margin-top:12px;"><b style="color:{a};">What to do:</b> {_esc(action)}</div>'
 
     return (
         f'{REPORT_MARKER}'
-        f'<div style="max-width:640px;border:1px solid {s["accent"]};border-left:5px solid {s["accent"]};border-radius:10px;background:{s["soft"]};color:{s["ink"]};font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;padding:14px 18px;margin:0 0 18px;">'
+        f'<div style="border-left:4px solid {a};padding:2px 0 2px 14px;margin:0 0 18px;'
+        f'font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;">'
         f'<table role="presentation" style="width:100%;border-collapse:collapse;"><tr>'
-        f'<td style="font-size:15px;font-weight:800;color:{s["accent"]};">{s["icon"]} Clarivise Shield &mdash; {s["label"]}</td>'
+        f'<td style="font-size:15px;font-weight:800;color:{a};padding-bottom:2px;">{s["icon"]} Clarivise Shield &mdash; {s["label"]}</td>'
         f'<td style="text-align:right;vertical-align:top;">{scores_html}</td></tr></table>'
-        f'<div style="margin-top:8px;color:{s["ink"]};">{summary}</div>'
+        f'<div style="margin-top:6px;">{summary}</div>'
         f'{findings_html}{action_html}'
         f'</div>'
     )
