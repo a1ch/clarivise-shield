@@ -57,6 +57,9 @@ SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
 ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
 POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+# Auto-discover every tenant mailbox instead of a fixed list (needs User.Read.All app perm).
+AUTO_DISCOVER       = os.environ.get("SHIELD_AUTO_DISCOVER", "true").lower() == "true"
+DISCOVER_REFRESH_SECS = int(os.environ.get("SHIELD_DISCOVER_REFRESH_SECONDS", "3600"))
 # Multi-mailbox: comma-separated list to scan; falls back to single SHIELD_MAILBOX.
 MAILBOXES           = [m.strip() for m in os.environ.get("SHIELD_MAILBOXES", MAILBOX).split(",") if m.strip()]
 # Real-inbox safety: do not rewrite subjects, do not mark mail read (both default off).
@@ -112,6 +115,7 @@ app = FastAPI(title="Clarivise Shield Connector", version="1.0.0", lifespan=life
 
 _token_cache: dict = {"token": None, "expires_at": 0.0}
 _processed: set = set()
+_discovered: dict = {"mailboxes": [], "at": 0.0}
 
 
 # ── Microsoft Graph Auth ───────────────────────────────────────────────────────
@@ -502,6 +506,37 @@ async def poll_mailbox_once(mailbox: str):
                 asyncio.create_task(process_message(mailbox, message_id))
 
 
+async def discover_mailboxes() -> list[str]:
+    """Return every tenant mailbox (enabled users with mail/UPN). Cached + refreshed
+    periodically. Needs the app to have User.Read.All (application). Falls back to the
+    static MAILBOXES list on any error."""
+    now = datetime.now(timezone.utc).timestamp()
+    if _discovered["mailboxes"] and _discovered["at"] > now - DISCOVER_REFRESH_SECS:
+        return _discovered["mailboxes"]
+    boxes: list[str] = []
+    async with httpx.AsyncClient() as client:
+        path: Optional[str] = "/users?$select=mail,userPrincipalName,accountEnabled&$top=999"
+        try:
+            while path:
+                data = await graph_get(client, path)
+                for u in data.get("value", []):
+                    if u.get("accountEnabled") is False:
+                        continue
+                    addr = u.get("mail") or u.get("userPrincipalName")
+                    if addr and "#EXT#" not in addr:
+                        boxes.append(addr)
+                nxt = data.get("@odata.nextLink")
+                path = nxt.replace(GRAPH_BASE, "") if nxt else None
+        except Exception as ex:
+            log.error("Mailbox discovery failed: %s (using last known / seed list)", ex)
+            return _discovered["mailboxes"] or MAILBOXES
+    if boxes:
+        _discovered["mailboxes"] = boxes
+        _discovered["at"] = now
+        log.info("Discovered %d mailbox(es): %s", len(boxes), ", ".join(boxes))
+    return _discovered["mailboxes"] or MAILBOXES
+
+
 async def mailbox_poll_loop():
     """
     Background loop: poll the shared mailbox on a fixed interval.
@@ -516,7 +551,8 @@ async def mailbox_poll_loop():
     log.info("Poll loop started — interval %ds, mailboxes: %s", POLL_INTERVAL_SECS, ", ".join(MAILBOXES))
     while True:
         try:
-            for _mbox in MAILBOXES:
+            mailboxes = await discover_mailboxes() if AUTO_DISCOVER else MAILBOXES
+            for _mbox in mailboxes:
                 await poll_mailbox_once(_mbox)
         except asyncio.CancelledError:
             raise
@@ -549,7 +585,8 @@ async def reprocess(message_id: str, background_tasks: BackgroundTasks):
 @app.post("/poll/now")
 async def poll_now():
     """Trigger an immediate poll of the mailbox — useful for testing without waiting."""
-    for _mbox in MAILBOXES:
+    _boxes = await discover_mailboxes() if AUTO_DISCOVER else MAILBOXES
+    for _mbox in _boxes:
         asyncio.create_task(poll_mailbox_once(_mbox))
     return {"status": "poll triggered"}
 
