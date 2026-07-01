@@ -307,7 +307,7 @@ async def analyze_with_shield(client: httpx.AsyncClient, email_data: dict) -> Op
 VERDICT_STYLES = {
     "SAFE":       {"bg": "#e6f4ea", "border": "#28a745", "text": "#1e7e34", "icon": "✅", "label": "Safe"},
     "SPAM":       {"bg": "#f1f3f5", "border": "#868e96", "text": "#495057", "icon": "\U0001F4E7", "label": "Spam"},
-    "SUSPICIOUS": {"bg": "#fff3cd", "border": "#ffc107", "text": "#856404", "icon": "⚠️", "label": "Suspicious"},
+    "SUSPICIOUS": {"bg": "#fff8e6", "border": "#e0a800", "text": "#5c4600", "icon": "⚠️", "label": "Suspicious"},
     "PHISHING":   {"bg": "#f8d7da", "border": "#dc3545", "text": "#721c24", "icon": "\U0001F6D1", "label": "Phishing"},
 }
 REPORT_MARKER = "<!--clarivise-shield-report-->"

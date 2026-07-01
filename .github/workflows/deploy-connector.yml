@@ -26,6 +26,9 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Set subscription
+        run: az account set --subscription ${{ env.SUBSCRIPTION }}
+
       - name: Build image in ACR (no local Docker needed)
         run: |
           az acr build --registry ${{ env.ACR_NAME }} --image ${{ env.IMAGE_NAME }}:${{ github.sha }} --image ${{ env.IMAGE_NAME }}:latest ./connector
