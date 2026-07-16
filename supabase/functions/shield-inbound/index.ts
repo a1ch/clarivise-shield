@@ -38,6 +38,7 @@ KEY RULES:
 11. Account creation confirmations, email verification, security alerts, and sign-up confirmations from known major platforms (Google, Microsoft, Apple, GitHub, LinkedIn, Dropbox, DocuSign, Zoom, AWS, Stripe, etc.) sent to any domain = verdict SAFE, phishing_score 5 or less. These are expected transactional emails. However, always include a finding reminding the user: if they did not initiate this action, they should contact IT Security immediately as it may indicate unauthorized account creation or credential stuffing.
 12. Do NOT flag an email as SUSPICIOUS purely because a consumer/personal service email was received at a business domain. Business users routinely receive transactional emails from consumer platforms.
 13. Google-owned short link domains (c.gle, goo.gl, g.co) are legitimate URL shorteners used in official Google emails — do NOT treat them as suspicious or obfuscated. If present in an email that is otherwise legitimate, note them as an informational finding only (e.g. "This email uses Google's link shortener — this is normal for Google communications") and do not increase the phishing score on this basis alone.
+14. QR codes (quishing): if a QR CODE section lists destination URL(s) decoded from an image embedded in this email, treat each as a real, reader-hidden link. A QR code leading to a login, verification, payment, or credential page = SUSPICIOUS minimum; if it requests credentials/payment or points to a lookalike or unexpected domain = PHISHING. Add a finding that names the QR destination.
 
 Write findings for a non-technical audience. Explain what the attacker is doing and how to spot it.
 
@@ -85,6 +86,7 @@ serve(async (req) => {
     sender?: string; recipient?: string; body?: string
     links?: Array<{ display: string; href: string; fullUrl: string; mismatch?: boolean }>
     attachments?: string[]; replyTo?: string; isExternal?: boolean; receivedAt?: string
+    qrLinks?: string[]; hasQrCode?: boolean
   }
 
   // ── Check allowlist ───────────────────────────────────────────────────────
@@ -173,6 +175,10 @@ serve(async (req) => {
 function buildUserPrompt(email: Record<string, unknown>, org: Record<string, unknown>): string {
   const links = (email.links as Array<{ display: string; href: string; mismatch?: boolean }> ?? [])
   const attachments = (email.attachments as string[] ?? [])
+  const qrLinks = (email.qrLinks as string[] ?? [])
+  const qrBlock = qrLinks.length > 0
+    ? `\n\nQR CODE (decoded from an image embedded in this email — hidden from the reader):\n${qrLinks.map(u => ` - ${u}`).join('\n')}`
+    : ''
   const linksBlock = links.length > 0
     ? links.map(l => ` - Display: "${l.display}" -> Real domain: ${l.href}${l.mismatch ? ' WARNING: DOMAIN MISMATCH' : ''}`).join('\n')
     : '(none)'
@@ -193,7 +199,7 @@ ${String(email.body ?? '(empty)').slice(0, 3000)}
 Attachments: ${attachments.length > 0 ? attachments.join(', ') : '(none)'}
 
 Links:
-${linksBlock}`
+${linksBlock}${qrBlock}`
 }
 
 function extractDomain(email: string): string {

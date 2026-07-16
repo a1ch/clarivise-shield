@@ -34,9 +34,18 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
+import base64
+import io
 from urllib.parse import urlparse
 
 import httpx
+
+try:
+    import zxingcpp  # QR / barcode decoding for quishing detection
+    from PIL import Image
+    _QR_AVAILABLE = True
+except Exception:  # library optional at import time; connector still runs without QR decoding
+    _QR_AVAILABLE = False
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 
@@ -71,6 +80,8 @@ SCAN_AFTER_ISO      = None
 GRAPH_BASE     = "https://graph.microsoft.com/v1.0"
 TOKEN_URL      = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 MAX_BODY_CHARS = 3000
+QR_MAX_IMAGE_BYTES = int(os.environ.get("SHIELD_QR_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))  # skip images larger than this
+QR_MAX_IMAGES      = int(os.environ.get("SHIELD_QR_MAX_IMAGES", "10"))
 
 # ── Known URL shortener domains ────────────────────────────────────────────────
 # These are resolved to their final destination before AI analysis.
@@ -214,6 +225,69 @@ async def resolve_short_links(links: list[dict]) -> list[dict]:
     return list(await asyncio.gather(*[resolve_one(l) for l in links]))
 
 
+# ── QR / quishing decoding ─────────────────────────────────────────────────────
+def _qr_text_to_url(text: str) -> Optional[str]:
+    """Turn a decoded QR payload into an http(s) URL, or None for non-URL payloads."""
+    if not text:
+        return None
+    url = text.strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        if re.match(r"^www\.", url, re.IGNORECASE) or re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", url, re.IGNORECASE):
+            url = "https://" + url
+        else:
+            return None
+    try:
+        if not urlparse(url).netloc:
+            return None
+    except Exception:
+        return None
+    return url
+
+
+async def decode_qr_from_message(client: httpx.AsyncClient, mailbox: str, message_id: str, attachments: list[dict]) -> list[dict]:
+    """Decode QR codes from image attachments / inline images. Returns link dicts (quishing targets)."""
+    if not _QR_AVAILABLE:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    images = [
+        a for a in (attachments or [])
+        if str(a.get("contentType", "")).lower().startswith("image/")
+        and 0 < int(a.get("size", 0) or 0) <= QR_MAX_IMAGE_BYTES
+    ][:QR_MAX_IMAGES]
+    for a in images:
+        att_id = a.get("id")
+        if not att_id:
+            continue
+        try:
+            att = await graph_get(
+                client,
+                f"/users/{mailbox}/messages/{message_id}/attachments/{att_id}?$select=contentBytes",
+            )
+            content_b64 = att.get("contentBytes")
+            if not content_b64:
+                continue
+            img = Image.open(io.BytesIO(base64.b64decode(content_b64)))
+            results = zxingcpp.read_barcodes(img)
+        except Exception as ex:
+            log.debug("QR decode failed for attachment %s: %s", att_id, ex)
+            continue
+        for r in results or []:
+            url = _qr_text_to_url(getattr(r, "text", "") or "")
+            if not url:
+                continue
+            try:
+                domain = urlparse(url).netloc.lower().replace("www.", "")
+            except Exception:
+                continue
+            key = domain + "|" + url
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"display": "QR code image", "href": domain, "fullUrl": url, "isQr": True})
+    return out
+
+
 # ── Email parsing ──────────────────────────────────────────────────────────────
 def extract_links(body_html: str, body_text: str) -> list[dict]:
     """Extract links from email body HTML."""
@@ -268,6 +342,8 @@ def parse_message(msg: dict) -> dict:
         "body":           body_clean,
         "links":          links,
         "attachments":    attachments,
+        "qrLinks":                  [],
+        "hasQrCode":                False,
         "hasHighRiskAttachment":    False,
         "hasSuspiciousAttachment":  False,
         "highRiskFiles":            [],
@@ -450,7 +526,7 @@ async def process_message(mailbox: str, message_id: str):
                 client,
                 f"/users/{mailbox}/messages/{message_id}"
                 "?$select=id,subject,from,toRecipients,body,replyTo,receivedDateTime,attachments"
-                "&$expand=attachments($select=name,contentType)",
+                "&$expand=attachments($select=id,name,contentType,isInline,size)",
             )
         except Exception as ex:
             log.error("Failed to fetch message %s: %s", message_id, ex)
@@ -464,6 +540,21 @@ async def process_message(mailbox: str, message_id: str):
         if short_links:
             log.info("Resolving %d short link(s) in message %s", len(short_links), message_id)
             email_data["links"] = await resolve_short_links(email_data["links"])
+
+        # QR / quishing: decode QR codes from image attachments, resolve, merge as links
+        try:
+            qr_links = await decode_qr_from_message(client, mailbox, message_id, msg.get("attachments", []))
+            if qr_links:
+                qr_links = await resolve_short_links(qr_links)
+                existing = {l.get("fullUrl") for l in email_data["links"]}
+                for ql in qr_links:
+                    if ql.get("fullUrl") not in existing:
+                        email_data["links"].append(ql)
+                email_data["qrLinks"]  = [l["fullUrl"] for l in qr_links]
+                email_data["hasQrCode"] = True
+                log.info("QR code(s) decoded in %s: %s", message_id, ", ".join(email_data["qrLinks"]))
+        except Exception as ex:
+            log.warning("QR decode step failed for %s: %s", message_id, ex)
 
         log.info("Processing: [%s] from %s", email_data["subject"][:60], email_data["sender"][:60])
 
