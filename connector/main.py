@@ -56,6 +56,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("shield-connector")
 
+# ── Error tracking (Sentry) ────────────────────────────────────────────────────
+# No-op when SENTRY_DSN is unset, so this is safe to ship before a DSN exists.
+# sentry-sdk's default logging integration also captures log.error() as events,
+# so the connector's existing error logging flows to Sentry automatically.
+try:
+    import sentry_sdk
+    _SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+    if _SENTRY_DSN:
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=os.environ.get("SHIELD_ENV", "production"),
+            release=os.environ.get("SHIELD_RELEASE") or None,
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            send_default_pii=False,  # never ship email addresses / bodies to Sentry
+        )
+        log.info("Sentry error tracking enabled (env=%s)", os.environ.get("SHIELD_ENV", "production"))
+    else:
+        log.info("Sentry disabled (no SENTRY_DSN set)")
+except Exception as _sentry_err:  # telemetry must never break startup
+    log.warning("Sentry init skipped: %s", _sentry_err)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 TENANT_ID           = os.environ["AZURE_TENANT_ID"]
 CLIENT_ID           = os.environ["AZURE_CLIENT_ID"]
