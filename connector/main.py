@@ -85,6 +85,7 @@ MAILBOX             = os.environ["SHIELD_MAILBOX"]
 SHIELD_WEBHOOK      = os.environ["SHIELD_INBOUND_URL"]
 SHIELD_SECRET       = os.environ["SHIELD_INBOUND_SECRET"]
 NOTIFICATION_SECRET = os.environ.get("GRAPH_NOTIFICATION_SECRET", "")
+OPS_SECRET          = os.environ.get("SHIELD_OPS_SECRET", "")
 ORG_ID              = os.environ.get("SHIELD_ORG_ID", "f775557a-cbe4-4b77-ab43-b20b9799db3e")
 POLL_INTERVAL_SECS  = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 # Auto-discover every tenant mailbox instead of a fixed list (needs User.Read.All app perm).
@@ -692,6 +693,15 @@ async def mailbox_poll_loop():
         await asyncio.sleep(POLL_INTERVAL_SECS)
 
 
+# ── Ops endpoint auth ──────────────────────────────────────────────────────────
+def _check_ops_secret(request: Request):
+    """Guard for the manual ops endpoints. Default-deny: requires the x-ops-secret
+    header to match SHIELD_OPS_SECRET, and returns 401 if the env var is unset — so
+    these endpoints are never open to the internet unconfigured."""
+    if not OPS_SECRET or request.headers.get("x-ops-secret") != OPS_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # ── Health & admin endpoints ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -705,8 +715,9 @@ async def health():
 
 
 @app.post("/webhook/reprocess/{message_id}")
-async def reprocess(message_id: str, background_tasks: BackgroundTasks):
+async def reprocess(message_id: str, background_tasks: BackgroundTasks, request: Request):
     """Manually reprocess a specific message — useful for testing."""
+    _check_ops_secret(request)
     _mbox = MAILBOXES[0]
     _processed.discard(f"{_mbox}:{message_id}")
     background_tasks.add_task(process_message, _mbox, message_id)
@@ -714,8 +725,9 @@ async def reprocess(message_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/poll/now")
-async def poll_now():
+async def poll_now(request: Request):
     """Trigger an immediate poll of the mailbox — useful for testing without waiting."""
+    _check_ops_secret(request)
     _boxes = await discover_mailboxes() if AUTO_DISCOVER else MAILBOXES
     for _mbox in _boxes:
         asyncio.create_task(poll_mailbox_once(_mbox))
